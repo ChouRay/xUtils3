@@ -8,6 +8,7 @@ import android.text.TextUtils;
 import org.xutils.cache.DiskCacheEntity;
 import org.xutils.cache.LruDiskCache;
 import org.xutils.common.util.IOUtil;
+import org.xutils.common.util.KeyValue;
 import org.xutils.common.util.LogUtil;
 import org.xutils.ex.HttpException;
 import org.xutils.http.HttpMethod;
@@ -18,12 +19,15 @@ import org.xutils.http.cookie.DbCookieStore;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.lang.reflect.Field;
 import java.lang.reflect.Type;
 import java.net.CookieManager;
 import java.net.CookiePolicy;
 import java.net.HttpURLConnection;
+import java.net.ProtocolException;
 import java.net.Proxy;
 import java.net.URL;
+import java.net.URLDecoder;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.GregorianCalendar;
@@ -47,6 +51,7 @@ public class HttpRequest extends UriRequest {
     private boolean isLoading = false;
     private InputStream inputStream = null;
     private HttpURLConnection connection = null;
+    private int responseCode = 0;
 
     // cookie manager
     private static final CookieManager COOKIE_MANAGER =
@@ -66,18 +71,23 @@ public class HttpRequest extends UriRequest {
         } else if (!uri.endsWith("?")) {
             queryBuilder.append("&");
         }
-        HashMap<String, String> queryParams = params.getQueryStringParams();
+        List<KeyValue> queryParams = params.getQueryStringParams();
         if (queryParams != null) {
-            for (Map.Entry<String, String> entry : queryParams.entrySet()) {
-                String name = entry.getKey();
-                String value = entry.getValue();
-                if (!TextUtils.isEmpty(name) && !TextUtils.isEmpty(value)) {
-                    queryBuilder.append(Uri.encode(name)).append("=").append(Uri.encode(value)).append("&");
+            for (KeyValue kv : queryParams) {
+                String name = kv.key;
+                String value = kv.getValueStr();
+                if (!TextUtils.isEmpty(name) && value != null) {
+                    queryBuilder.append(
+                            Uri.encode(name, params.getCharset()))
+                            .append("=")
+                            .append(Uri.encode(value, params.getCharset()))
+                            .append("&");
                 }
             }
-            if (queryBuilder.charAt(queryBuilder.length() - 1) == '&') {
-                queryBuilder.deleteCharAt(queryBuilder.length() - 1);
-            }
+        }
+
+        if (queryBuilder.charAt(queryBuilder.length() - 1) == '&') {
+            queryBuilder.deleteCharAt(queryBuilder.length() - 1);
         }
 
         if (queryBuilder.charAt(queryBuilder.length() - 1) == '?') {
@@ -105,8 +115,9 @@ public class HttpRequest extends UriRequest {
      */
     @Override
     @TargetApi(Build.VERSION_CODES.KITKAT)
-    public void sendRequest() throws IOException {
+    public void sendRequest() throws Throwable {
         isLoading = false;
+        responseCode = 0;
 
         URL url = new URL(queryUrl);
         { // init connection
@@ -116,6 +127,12 @@ public class HttpRequest extends UriRequest {
             } else {
                 connection = (HttpURLConnection) url.openConnection();
             }
+
+            // try to fix bug: accidental EOFException before API 19
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.KITKAT) {
+                connection.setRequestProperty("Connection", "close");
+            }
+
             connection.setReadTimeout(params.getConnectTimeout());
             connection.setConnectTimeout(params.getConnectTimeout());
             connection.setInstanceFollowRedirects(params.getRedirectHandler() == null);
@@ -127,8 +144,7 @@ public class HttpRequest extends UriRequest {
             }
         }
 
-        {// add headers
-
+        if (params.isUseCookie()) {// add cookies
             try {
                 Map<String, List<String>> singleMap =
                         COOKIE_MANAGER.get(url.toURI(), new HashMap<String, List<String>>(0));
@@ -139,23 +155,43 @@ public class HttpRequest extends UriRequest {
             } catch (Throwable ex) {
                 LogUtil.e(ex.getMessage(), ex);
             }
+        }
 
-            HashMap<String, String> headers = params.getHeaders();
+        {// add headers
+            List<RequestParams.Header> headers = params.getHeaders();
             if (headers != null) {
-                for (Map.Entry<String, String> entry : headers.entrySet()) {
-                    String name = entry.getKey();
-                    String value = entry.getValue();
+                for (RequestParams.Header header : headers) {
+                    String name = header.key;
+                    String value = header.getValueStr();
                     if (!TextUtils.isEmpty(name) && !TextUtils.isEmpty(value)) {
-                        connection.setRequestProperty(name, value);
+                        if (header.setHeader) {
+                            connection.setRequestProperty(name, value);
+                        } else {
+                            connection.addRequestProperty(name, value);
+                        }
                     }
                 }
             }
+        }
 
+        // intercept response
+        if (requestInterceptListener != null) {
+            requestInterceptListener.beforeRequest(this);
         }
 
         { // write body
             HttpMethod method = params.getMethod();
-            connection.setRequestMethod(method.toString());
+            try {
+                connection.setRequestMethod(method.toString());
+            } catch (ProtocolException ex) {
+                try { // fix: HttpURLConnection not support PATCH method.
+                    Field methodField = HttpURLConnection.class.getDeclaredField("method");
+                    methodField.setAccessible(true);
+                    methodField.set(connection, method.toString());
+                } catch (Throwable ignored) {
+                    throw ex;
+                }
+            }
             if (HttpMethod.permitsRequestBody(method)) {
                 RequestBody body = params.getRequestBody();
                 if (body != null) {
@@ -185,18 +221,7 @@ public class HttpRequest extends UriRequest {
             }
         }
 
-        // check response code
-        int code = connection.getResponseCode();
-        if (code >= 300) {
-            HttpException httpException = new HttpException(code, this.getResponseMessage());
-            try {
-                httpException.setResult(IOUtil.readStr(connection.getInputStream(), params.getCharset()));
-            } catch (Throwable ignored) {
-            }
-            throw httpException;
-        }
-
-        { // save cookies
+        if (params.isUseCookie()) { // save cookies
             try {
                 Map<String, List<String>> headers = connection.getHeaderFields();
                 if (headers != null) {
@@ -205,6 +230,24 @@ public class HttpRequest extends UriRequest {
             } catch (Throwable ex) {
                 LogUtil.e(ex.getMessage(), ex);
             }
+        }
+
+        // check response code
+        responseCode = connection.getResponseCode();
+        // intercept response
+        if (requestInterceptListener != null) {
+            requestInterceptListener.afterRequest(this);
+        }
+        if (responseCode == 204 || responseCode == 205) { // empty content
+            throw new HttpException(responseCode, this.getResponseMessage());
+        } else if (responseCode >= 300) {
+            HttpException httpException = new HttpException(responseCode, this.getResponseMessage());
+            try {
+                httpException.setResult(IOUtil.readStr(this.getInputStream(), params.getCharset()));
+            } catch (Throwable ignored) {
+            }
+            LogUtil.e(httpException.toString() + ", url: " + queryUrl);
+            throw httpException;
         }
 
         isLoading = true;
@@ -222,7 +265,7 @@ public class HttpRequest extends UriRequest {
             cacheKey = params.getCacheKey();
 
             if (TextUtils.isEmpty(cacheKey)) {
-                cacheKey = queryUrl;
+                cacheKey = params.toString();
             }
         }
         return cacheKey;
@@ -243,17 +286,19 @@ public class HttpRequest extends UriRequest {
     @Override
     public Object loadResultFromCache() throws Throwable {
         isLoading = true;
-        DiskCacheEntity cacheEntity = LruDiskCache.getDiskCache(params.getCacheDirName()).get(this.getCacheKey());
+        DiskCacheEntity cacheEntity = LruDiskCache.getDiskCache(params.getCacheDirName())
+                .setMaxSize(params.getCacheSize())
+                .get(this.getCacheKey());
 
         if (cacheEntity != null) {
             if (HttpMethod.permitsCache(params.getMethod())) {
                 Date lastModified = cacheEntity.getLastModify();
                 if (lastModified.getTime() > 0) {
-                    params.addHeader("If-Modified-Since", toGMTString(lastModified));
+                    params.setHeader("If-Modified-Since", toGMTString(lastModified));
                 }
                 String eTag = cacheEntity.getEtag();
                 if (!TextUtils.isEmpty(eTag)) {
-                    params.addHeader("If-None-Match", eTag);
+                    params.setHeader("If-None-Match", eTag);
                 }
             }
             return loader.loadFromCache(cacheEntity);
@@ -264,14 +309,15 @@ public class HttpRequest extends UriRequest {
 
     @Override
     public void clearCacheHeader() {
-        params.addHeader("If-Modified-Since", null);
-        params.addHeader("If-None-Match", null);
+        params.setHeader("If-Modified-Since", null);
+        params.setHeader("If-None-Match", null);
     }
 
     @Override
     public InputStream getInputStream() throws IOException {
         if (connection != null && inputStream == null) {
-            inputStream = connection.getInputStream();
+            inputStream = connection.getResponseCode() >= 400 ?
+                    connection.getErrorStream() : connection.getInputStream();
         }
         return inputStream;
     }
@@ -280,9 +326,11 @@ public class HttpRequest extends UriRequest {
     public void close() throws IOException {
         if (inputStream != null) {
             IOUtil.closeQuietly(inputStream);
+            inputStream = null;
         }
         if (connection != null) {
             connection.disconnect();
+            //connection = null;
         }
     }
 
@@ -313,7 +361,7 @@ public class HttpRequest extends UriRequest {
     @Override
     public int getResponseCode() throws IOException {
         if (connection != null) {
-            return connection.getResponseCode();
+            return responseCode;
         } else {
             if (this.getInputStream() != null) {
                 return 200;
@@ -326,7 +374,7 @@ public class HttpRequest extends UriRequest {
     @Override
     public String getResponseMessage() throws IOException {
         if (connection != null) {
-            return Uri.decode(connection.getResponseMessage());
+            return URLDecoder.decode(connection.getResponseMessage(), params.getCharset());
         } else {
             return null;
         }
@@ -367,7 +415,11 @@ public class HttpRequest extends UriRequest {
             expiration = connection.getExpiration();
         }
 
-        if (expiration <= 0) {
+        if (expiration <= 0L && params.getCacheMaxAge() > 0L) {
+            expiration = System.currentTimeMillis() + params.getCacheMaxAge();
+        }
+
+        if (expiration <= 0L) {
             expiration = Long.MAX_VALUE;
         }
         return expiration;

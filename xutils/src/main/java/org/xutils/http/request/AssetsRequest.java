@@ -5,7 +5,6 @@ import org.xutils.cache.LruDiskCache;
 import org.xutils.common.util.IOUtil;
 import org.xutils.common.util.LogUtil;
 import org.xutils.http.RequestParams;
-import org.xutils.http.loader.InputStreamLoader;
 import org.xutils.x;
 
 import java.io.File;
@@ -30,7 +29,7 @@ public class AssetsRequest extends UriRequest {
     }
 
     @Override
-    public void sendRequest() throws IOException {
+    public void sendRequest() throws Throwable {
 
     }
 
@@ -46,15 +45,14 @@ public class AssetsRequest extends UriRequest {
 
     @Override
     public Object loadResult() throws Throwable {
-        if (loader instanceof InputStreamLoader) {
-            return getInputStream();
-        }
         return this.loader.load(this);
     }
 
     @Override
     public Object loadResultFromCache() throws Throwable {
-        DiskCacheEntity cacheEntity = LruDiskCache.getDiskCache(params.getCacheDirName()).get(this.getCacheKey());
+        DiskCacheEntity cacheEntity = LruDiskCache.getDiskCache(params.getCacheDirName())
+                .setMaxSize(params.getCacheSize())
+                .get(this.getCacheKey());
 
         if (cacheEntity != null) {
             Date lastModifiedDate = cacheEntity.getLastModify();
@@ -87,6 +85,7 @@ public class AssetsRequest extends UriRequest {
     @Override
     public void close() throws IOException {
         IOUtil.closeQuietly(inputStream);
+        inputStream = null;
     }
 
     @Override
